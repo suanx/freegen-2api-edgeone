@@ -58,7 +58,51 @@ export async function onRequest(context) {
   return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
 }
 
-// ---[第三部分: KV 缓存支持] ---
+// ---[第三部分: 请求队列与限流] ---
+
+// 请求队列控制
+const requestQueue = {
+  queue: [],
+  processing: false,
+  lastRequestTime: 0,
+  minInterval: 3000, // 最小请求间隔 3 秒
+};
+
+async function enqueueRequest(fn) {
+  return new Promise((resolve, reject) => {
+    requestQueue.queue.push({ fn, resolve, reject });
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (requestQueue.processing || requestQueue.queue.length === 0) return;
+  
+  requestQueue.processing = true;
+  
+  while (requestQueue.queue.length > 0) {
+    const { fn, resolve, reject } = requestQueue.queue.shift();
+    
+    // 控制请求间隔
+    const elapsed = Date.now() - requestQueue.lastRequestTime;
+    if (elapsed < requestQueue.minInterval) {
+      await new Promise(r => setTimeout(r, requestQueue.minInterval - elapsed));
+    }
+    
+    try {
+      const result = await fn();
+      resolve(result);
+    } catch (err) {
+      reject(err);
+    }
+    
+    requestQueue.lastRequestTime = Date.now();
+  }
+  
+  requestQueue.processing = false;
+}
+
+// ---[第四部分: KV 缓存支持] ---
 async function getCachedImage(prompt, ratio_id) {
   const cacheKey = `img:${btoa(prompt + ratio_id).substring(0, 32)}`;
   try {
@@ -159,56 +203,93 @@ async function generateImage(prompt, ratio_id = "1:1", image_data = null, ctx) {
 async function generateImageDirect(prompt, ratio_id = "1:1", image_data = null, ctx) {
   const startTime = Date.now();
 
-  const signerRes = await fetch(CONFIG.SIGNER_URL, {
-    method: "POST",
-    headers: CONFIG.HEADERS,
-    body: JSON.stringify({ prompt })
-  });
-
-  if (!signerRes.ok) {
-    throw new Error(`Signer 签名失败: ${signerRes.status}`);
-  }
-  const { ts, sig } = await signerRes.json();
-
-  const genPayload = { prompt, ts, sig, ratio_id };
-  if (image_data) genPayload.image_data = image_data;
-
-  const genRes = await fetch(CONFIG.GENERATOR_URL, {
-    method: "POST",
-    headers: CONFIG.HEADERS,
-    body: JSON.stringify(genPayload)
-  });
-
-  if (!genRes.ok) {
-    throw new Error(`Generator 提交失败: ${genRes.status}`);
-  }
-  const genData = await genRes.json();
-
-  let finalImageUrl = null;
-
-  if (genData.image_data_url) {
-    finalImageUrl = genData.image_data_url;
-  } else if (genData.job_id) {
-    finalImageUrl = await waitForImageViaWebSocket(genData.job_id);
+  // 使用请求队列控制并发
+  return enqueueRequest(async () => {
+    // 指数退避重试
+    const maxRetries = 3;
+    let lastError = null;
     
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(
-        fetch(CONFIG.STATS_URL, {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const signerRes = await fetch(CONFIG.SIGNER_URL, {
           method: "POST",
           headers: CONFIG.HEADERS,
-          body: JSON.stringify({
-            job_id: genData.job_id,
-            total_time_ms: Date.now() - startTime,
-            timestamp: new Date().toISOString()
-          })
-        }).catch(err => console.error("Stats 记录失败:", err))
-      );
-    }
-  } else {
-    throw new Error("上游返回了未知的响应格式");
-  }
+          body: JSON.stringify({ prompt })
+        });
 
-  return finalImageUrl;
+        if (!signerRes.ok) {
+          if (signerRes.status === 429) {
+            const retryAfter = signerRes.headers.get('Retry-After') || 5;
+            const waitTime = Math.min(retryAfter * 1000, 30000);
+            console.log(`Signer 限流，等待 ${waitTime}ms (第 ${attempt} 次重试)`);
+            await new Promise(r => setTimeout(r, waitTime));
+            continue;
+          }
+          throw new Error(`Signer 签名失败: ${signerRes.status}`);
+        }
+        
+        const { ts, sig } = await signerRes.json();
+
+        const genPayload = { prompt, ts, sig, ratio_id };
+        if (image_data) genPayload.image_data = image_data;
+
+        const genRes = await fetch(CONFIG.GENERATOR_URL, {
+          method: "POST",
+          headers: CONFIG.HEADERS,
+          body: JSON.stringify(genPayload)
+        });
+
+        if (!genRes.ok) {
+          if (genRes.status === 429) {
+            const retryAfter = genRes.headers.get('Retry-After') || 5;
+            const waitTime = Math.min(retryAfter * 1000, 30000);
+            console.log(`Generator 限流，等待 ${waitTime}ms (第 ${attempt} 次重试)`);
+            await new Promise(r => setTimeout(r, waitTime));
+            continue;
+          }
+          throw new Error(`Generator 提交失败: ${genRes.status}`);
+        }
+        
+        const genData = await genRes.json();
+
+        let finalImageUrl = null;
+
+        if (genData.image_data_url) {
+          finalImageUrl = genData.image_data_url;
+        } else if (genData.job_id) {
+          finalImageUrl = await waitForImageViaWebSocket(genData.job_id);
+          
+          if (ctx?.waitUntil) {
+            ctx.waitUntil(
+              fetch(CONFIG.STATS_URL, {
+                method: "POST",
+                headers: CONFIG.HEADERS,
+                body: JSON.stringify({
+                  job_id: genData.job_id,
+                  total_time_ms: Date.now() - startTime,
+                  timestamp: new Date().toISOString()
+                })
+              }).catch(err => console.error("Stats 记录失败:", err))
+            );
+          }
+        } else {
+          throw new Error("上游返回了未知的响应格式");
+        }
+
+        return finalImageUrl;
+        
+      } catch (err) {
+        lastError = err;
+        if (attempt < maxRetries) {
+          const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+          console.log(`请求失败，${backoff}ms 后重试 (第 ${attempt}/${maxRetries})`);
+          await new Promise(r => setTimeout(r, backoff));
+        }
+      }
+    }
+    
+    throw lastError || new Error("生成失败");
+  });
 }
 
 // ---[第四部分: API 接口处理] ---
