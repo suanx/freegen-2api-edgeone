@@ -1,0 +1,9 @@
+{
+  "name": "freegen-2api-edgeone",
+  "version": "1.0.2",
+  "description": "FreeGen-2API for EdgeOne Pages",
+  "scripts": {
+    "build": "echo 'No build required'"
+  },
+  "license": "Apache-2.0"
+}
