@@ -58,7 +58,33 @@ export async function onRequest(context) {
   return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
 }
 
-// ---[第三部分: 核心业务逻辑] ---
+// ---[第三部分: KV 缓存支持] ---
+async function getCachedImage(prompt, ratio_id) {
+  const cacheKey = `img:${btoa(prompt + ratio_id).substring(0, 32)}`;
+  try {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      console.log('Cache hit:', cacheKey);
+      return await cached.json();
+    }
+  } catch (e) {
+    // KV 不可用时忽略
+  }
+  return null;
+}
+
+async function setCachedImage(prompt, ratio_id, result) {
+  const cacheKey = `img:${btoa(prompt + ratio_id).substring(0, 32)}`;
+  try {
+    await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
+      headers: { 'Content-Type': 'application/json' }
+    }), { expirationTtl: 3600 }); // 缓存 1 小时
+  } catch (e) {
+    // KV 不可用时忽略
+  }
+}
+
+// ---[第四部分: 核心业务逻辑] ---
 
 async function waitForImageViaWebSocket(jobId) {
   const timestamp = Math.floor(Date.now() / 1000);
@@ -108,6 +134,29 @@ async function waitForImageViaWebSocket(jobId) {
 }
 
 async function generateImage(prompt, ratio_id = "1:1", image_data = null, ctx) {
+  // 图生图不使用缓存（每次图片不同）
+  if (image_data) {
+    return generateImageDirect(prompt, ratio_id, image_data, ctx);
+  }
+
+  // 检查缓存
+  const cached = await getCachedImage(prompt, ratio_id);
+  if (cached) {
+    return cached;
+  }
+
+  // 缓存未命中，直接生成
+  const imageUrl = await generateImageDirect(prompt, ratio_id, null, ctx);
+  
+  // 缓存结果
+  if (imageUrl) {
+    await setCachedImage(prompt, ratio_id, imageUrl);
+  }
+  
+  return imageUrl;
+}
+
+async function generateImageDirect(prompt, ratio_id = "1:1", image_data = null, ctx) {
   const startTime = Date.now();
 
   const signerRes = await fetch(CONFIG.SIGNER_URL, {
